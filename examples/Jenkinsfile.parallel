@@ -1,0 +1,164 @@
+// Jenkinsfile với parallel execution
+// File: examples/Jenkinsfile.parallel
+// Chạy nhiều tasks đồng thời để tiết kiệm thời gian
+
+pipeline {
+    agent any
+    
+    tools {
+        nodejs 'NodeJS'
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+        
+        stage('Install Dependencies') {
+            steps {
+                sh 'npm ci'
+            }
+        }
+        
+        stage('Parallel Quality Checks') {
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        echo '🧪 Running unit tests...'
+                        sh 'npm run test:unit -- --coverage'
+                    }
+                    post {
+                        always {
+                            junit 'test-results/unit/**/*.xml'
+                        }
+                    }
+                }
+                
+                stage('Integration Tests') {
+                    steps {
+                        echo '🔗 Running integration tests...'
+                        sh 'npm run test:integration'
+                    }
+                    post {
+                        always {
+                            junit 'test-results/integration/**/*.xml'
+                        }
+                    }
+                }
+                
+                stage('E2E Tests') {
+                    steps {
+                        echo '🌐 Running E2E tests...'
+                        sh 'npm run test:e2e'
+                    }
+                    post {
+                        always {
+                            junit 'test-results/e2e/**/*.xml'
+                        }
+                    }
+                }
+                
+                stage('Lint') {
+                    steps {
+                        echo '🔍 Running linter...'
+                        sh 'npm run lint'
+                    }
+                }
+                
+                stage('Type Check') {
+                    steps {
+                        echo '📝 Running type checker...'
+                        sh 'npm run type-check || true'
+                    }
+                }
+                
+                stage('Security Audit') {
+                    steps {
+                        echo '🔒 Running security audit...'
+                        sh 'npm audit --audit-level=moderate'
+                    }
+                }
+            }
+        }
+        
+        stage('Build') {
+            steps {
+                echo '🔨 Building application...'
+                sh 'npm run build'
+            }
+        }
+        
+        stage('Parallel Deployments') {
+            when {
+                branch 'main'
+            }
+            parallel {
+                stage('Deploy to Server 1') {
+                    steps {
+                        echo '🚀 Deploying to Server 1...'
+                        sh './deploy.sh server1'
+                    }
+                }
+                
+                stage('Deploy to Server 2') {
+                    steps {
+                        echo '🚀 Deploying to Server 2...'
+                        sh './deploy.sh server2'
+                    }
+                }
+                
+                stage('Deploy to Server 3') {
+                    steps {
+                        echo '🚀 Deploying to Server 3...'
+                        sh './deploy.sh server3'
+                    }
+                }
+            }
+        }
+        
+        stage('Parallel Notifications') {
+            parallel {
+                stage('Slack Notification') {
+                    steps {
+                        echo '💬 Sending Slack notification...'
+                        slackSend color: 'good', message: 'Build completed!'
+                    }
+                }
+                
+                stage('Email Notification') {
+                    steps {
+                        echo '📧 Sending email notification...'
+                        emailext subject: 'Build Success', body: 'Build completed', to: 'team@example.com'
+                    }
+                }
+                
+                stage('Update Dashboard') {
+                    steps {
+                        echo '📊 Updating dashboard...'
+                        sh './update-dashboard.sh'
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo '📊 Publishing test results...'
+            publishHTML([
+                reportDir: 'coverage',
+                reportFiles: 'index.html',
+                reportName: 'Coverage Report'
+            ])
+            cleanWs()
+        }
+        success {
+            echo '✅ All parallel stages completed successfully!'
+        }
+        failure {
+            echo '❌ One or more parallel stages failed!'
+        }
+    }
+}

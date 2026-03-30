@@ -1,0 +1,106 @@
+// Jenkinsfile với Docker build và push
+// File: examples/Jenkinsfile.docker
+
+pipeline {
+    agent any
+    
+    environment {
+        DOCKER_IMAGE = 'myapp'
+        DOCKER_TAG = "${env.BUILD_NUMBER}"
+        DOCKER_REGISTRY = 'docker.io'
+        DOCKER_REPO = 'myusername/myapp'
+        DOCKER_CREDENTIALS = credentials('docker-hub-credentials')
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                echo '🐳 Building Docker image...'
+                script {
+                    dockerImage = docker.build("${DOCKER_REPO}:${DOCKER_TAG}")
+                    
+                    // Also tag as latest
+                    sh "docker tag ${DOCKER_REPO}:${DOCKER_TAG} ${DOCKER_REPO}:latest"
+                }
+            }
+        }
+        
+        stage('Test Docker Image') {
+            steps {
+                echo '🧪 Testing Docker image...'
+                script {
+                    // Run tests inside container
+                    dockerImage.inside {
+                        sh 'npm test -- --watchAll=false'
+                    }
+                }
+            }
+        }
+        
+        stage('Scan Image') {
+            steps {
+                echo '🔍 Scanning image for vulnerabilities...'
+                script {
+                    try {
+                        sh "docker scan ${DOCKER_REPO}:${DOCKER_TAG} || true"
+                    } catch (Exception e) {
+                        echo "⚠️ Image scan found issues: ${e.message}"
+                    }
+                }
+            }
+        }
+        
+        stage('Push to Registry') {
+            when {
+                branch 'main'
+            }
+            steps {
+                echo '📤 Pushing to Docker registry...'
+                script {
+                    docker.withRegistry("https://${DOCKER_REGISTRY}", 'docker-hub-credentials') {
+                        dockerImage.push("${DOCKER_TAG}")
+                        dockerImage.push('latest')
+                    }
+                }
+                
+                echo "✅ Image pushed: ${DOCKER_REPO}:${DOCKER_TAG}"
+            }
+        }
+        
+        stage('Deploy Container') {
+            when {
+                branch 'main'
+            }
+            steps {
+                echo '🚀 Deploying container...'
+                sh """
+                    docker stop myapp-container || true
+                    docker rm myapp-container || true
+                    docker run -d \
+                        --name myapp-container \
+                        -p 3000:3000 \
+                        ${DOCKER_REPO}:${DOCKER_TAG}
+                """
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo '🧹 Cleaning up Docker images...'
+            sh 'docker system prune -f'
+        }
+        success {
+            echo "✅ Docker build and push completed: ${DOCKER_REPO}:${DOCKER_TAG}"
+        }
+        failure {
+            echo '❌ Docker pipeline failed!'
+        }
+    }
+}

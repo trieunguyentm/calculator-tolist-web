@@ -1,0 +1,225 @@
+// Jenkinsfile nâng cao với nhiều features
+// File: examples/Jenkinsfile.advanced
+
+pipeline {
+    agent any
+    
+    tools {
+        nodejs 'NodeJS'
+    }
+    
+    environment {
+        NODE_ENV = 'production'
+        BUILD_VERSION = "${env.BUILD_NUMBER}"
+        DEPLOY_SERVER = credentials('deploy-server-credentials')
+    }
+    
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'staging', 'production'],
+            description: 'Select deployment environment'
+        )
+        booleanParam(
+            name: 'RUN_TESTS',
+            defaultValue: true,
+            description: 'Run tests?'
+        )
+        booleanParam(
+            name: 'DEPLOY',
+            defaultValue: false,
+            description: 'Deploy after build?'
+        )
+    }
+    
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 1, unit: 'HOURS')
+        timestamps()
+        disableConcurrentBuilds()
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                echo "🔄 Checking out code from ${env.BRANCH_NAME}..."
+                checkout scm
+            }
+        }
+        
+        stage('Environment Info') {
+            steps {
+                echo "📊 Build Information:"
+                echo "  - Job: ${env.JOB_NAME}"
+                echo "  - Build Number: ${env.BUILD_NUMBER}"
+                echo "  - Branch: ${env.BRANCH_NAME}"
+                echo "  - Environment: ${params.ENVIRONMENT}"
+                sh 'node --version'
+                sh 'npm --version'
+            }
+        }
+        
+        stage('Install Dependencies') {
+            steps {
+                echo '📦 Installing dependencies...'
+                sh 'npm ci'  // Faster and more reliable than npm install
+            }
+        }
+        
+        stage('Code Quality') {
+            parallel {
+                stage('Lint') {
+                    steps {
+                        echo '🔍 Running linter...'
+                        script {
+                            try {
+                                sh 'npm run lint || true'
+                            } catch (Exception e) {
+                                echo "⚠️ Linting issues found: ${e.message}"
+                                currentBuild.result = 'UNSTABLE'
+                            }
+                        }
+                    }
+                }
+                
+                stage('Security Audit') {
+                    steps {
+                        echo '🔒 Running security audit...'
+                        script {
+                            try {
+                                sh 'npm audit --audit-level=moderate || true'
+                            } catch (Exception e) {
+                                echo "⚠️ Security vulnerabilities found: ${e.message}"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Run Tests') {
+            when {
+                expression { params.RUN_TESTS == true }
+            }
+            steps {
+                echo '🧪 Running tests...'
+                sh 'npm test -- --coverage --watchAll=false'
+            }
+            post {
+                always {
+                    junit 'test-results/**/*.xml'
+                    publishHTML([
+                        reportDir: 'coverage',
+                        reportFiles: 'index.html',
+                        reportName: 'Coverage Report',
+                        keepAll: true
+                    ])
+                }
+            }
+        }
+        
+        stage('Build') {
+            steps {
+                echo '🔨 Building application...'
+                sh 'npm run build'
+                
+                echo '📏 Build size:'
+                sh 'du -sh build/'
+            }
+        }
+        
+        stage('Archive Artifacts') {
+            steps {
+                echo '📦 Archiving build artifacts...'
+                archiveArtifacts artifacts: 'build/**/*', fingerprint: true
+                
+                // Stash for later stages
+                stash name: 'build-artifacts', includes: 'build/**/*'
+            }
+        }
+        
+        stage('Deploy') {
+            when {
+                expression { params.DEPLOY == true }
+            }
+            stages {
+                stage('Deploy to Dev') {
+                    when {
+                        expression { params.ENVIRONMENT == 'dev' }
+                    }
+                    steps {
+                        echo '🚀 Deploying to Development...'
+                        sh './deploy.sh dev'
+                    }
+                }
+                
+                stage('Deploy to Staging') {
+                    when {
+                        expression { params.ENVIRONMENT == 'staging' }
+                    }
+                    steps {
+                        echo '🚀 Deploying to Staging...'
+                        sh './deploy.sh staging'
+                    }
+                }
+                
+                stage('Deploy to Production') {
+                    when {
+                        allOf {
+                            expression { params.ENVIRONMENT == 'production' }
+                            branch 'main'
+                        }
+                    }
+                    steps {
+                        input message: '⚠️ Deploy to Production?', ok: 'Deploy', submitter: 'admin'
+                        
+                        echo '🚀 Deploying to Production...'
+                        sh './deploy.sh production'
+                        
+                        echo '✅ Deployment completed!'
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo '🧹 Cleaning up...'
+            cleanWs()
+        }
+        
+        success {
+            echo '✅ Pipeline completed successfully!'
+            script {
+                if (params.DEPLOY == true) {
+                    slackSend(
+                        color: 'good',
+                        message: "✅ Build #${env.BUILD_NUMBER} succeeded and deployed to ${params.ENVIRONMENT}"
+                    )
+                }
+            }
+        }
+        
+        failure {
+            echo '❌ Pipeline failed!'
+            emailext(
+                subject: "❌ Build Failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: """
+                    Build failed!
+                    
+                    Job: ${env.JOB_NAME}
+                    Build Number: ${env.BUILD_NUMBER}
+                    Branch: ${env.BRANCH_NAME}
+                    
+                    Check console output: ${env.BUILD_URL}console
+                """,
+                to: 'team@example.com'
+            )
+        }
+        
+        unstable {
+            echo '⚠️ Pipeline unstable (tests failed but build succeeded)'
+        }
+    }
+}

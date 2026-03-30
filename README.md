@@ -89,9 +89,11 @@ chmod +x build.sh
 ./build.sh
 ```
 
-## 🔧 Cấu hình Jenkins Freestyle Job
+## 🔧 Cấu hình Jenkins Jobs
 
-### Quick Start (5 phút):
+### Option 1: Freestyle Job (Cơ bản)
+
+**Quick Start (5 phút):**
 
 1. **Tạo Job:**
    - Jenkins Dashboard → New Item
@@ -115,9 +117,39 @@ chmod +x build.sh
 
 5. **Save và Build Now**
 
-### Hướng dẫn chi tiết:
+**Hướng dẫn chi tiết:** [`JENKINS_FREESTYLE_SETUP.md`](JENKINS_FREESTYLE_SETUP.md)
 
-Xem file [`JENKINS_FREESTYLE_SETUP.md`](JENKINS_FREESTYLE_SETUP.md) để có hướng dẫn đầy đủ bằng tiếng Việt.
+---
+
+### Option 2: Pipeline Job (Khuyến nghị ⭐)
+
+**Quick Start (5 phút):**
+
+1. **Tạo Job:**
+   - Jenkins Dashboard → New Item
+   - Tên: `react-app-pipeline`
+   - Type: **Pipeline**
+
+2. **Pipeline Configuration:**
+   - Definition: **Pipeline script from SCM**
+   - SCM: **Git**
+   - Repository URL: URL của repository
+   - Script Path: `Jenkinsfile`
+
+3. **Tạo Jenkinsfile:**
+   ```bash
+   cp examples/Jenkinsfile.basic Jenkinsfile
+   git add Jenkinsfile
+   git commit -m "Add Jenkinsfile"
+   git push
+   ```
+
+4. **Save và Build Now**
+
+**Hướng dẫn chi tiết:**
+- [`JENKINS_PIPELINE_SETUP.md`](JENKINS_PIPELINE_SETUP.md) - Setup Pipeline Job
+- [`JENKINSFILE_GUIDE.md`](JENKINSFILE_GUIDE.md) - Cấu trúc Jenkinsfile
+- [`examples/`](examples/) - 5+ Jenkinsfile examples
 
 ## ✅ Test Coverage
 

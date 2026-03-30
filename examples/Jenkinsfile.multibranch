@@ -1,0 +1,122 @@
+// Jenkinsfile cho Multi-branch Pipeline
+// File: examples/Jenkinsfile.multibranch
+// Tự động xử lý các branches khác nhau
+
+pipeline {
+    agent any
+    
+    tools {
+        nodejs 'NodeJS'
+    }
+    
+    environment {
+        NODE_ENV = "${getBuildEnvironment()}"
+        DEPLOY_URL = "${getDeployUrl()}"
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                echo "🔄 Building branch: ${env.BRANCH_NAME}"
+                checkout scm
+            }
+        }
+        
+        stage('Install Dependencies') {
+            steps {
+                sh 'npm ci'
+            }
+        }
+        
+        stage('Test') {
+            steps {
+                sh 'npm test -- --coverage --watchAll=false'
+            }
+        }
+        
+        stage('Build') {
+            steps {
+                echo "🔨 Building for ${env.NODE_ENV}..."
+                sh 'npm run build'
+            }
+        }
+        
+        stage('Deploy to Dev') {
+            when {
+                branch 'feature/*'
+            }
+            steps {
+                echo '🚀 Deploying feature branch to dev...'
+                sh './deploy.sh dev'
+            }
+        }
+        
+        stage('Deploy to Staging') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                echo '🚀 Deploying to staging...'
+                sh './deploy.sh staging'
+            }
+        }
+        
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                input message: 'Deploy to production?', ok: 'Deploy'
+                echo '🚀 Deploying to production...'
+                sh './deploy.sh production'
+            }
+        }
+        
+        stage('Create Release') {
+            when {
+                tag pattern: "v\\d+\\.\\d+\\.\\d+", comparator: "REGEXP"
+            }
+            steps {
+                echo "📦 Creating release for tag ${env.TAG_NAME}..."
+                sh './create-release.sh ${TAG_NAME}'
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo "✅ Build succeeded for ${env.BRANCH_NAME}"
+            script {
+                def message = "✅ Build #${env.BUILD_NUMBER} succeeded\nBranch: ${env.BRANCH_NAME}\nURL: ${env.DEPLOY_URL}"
+                slackSend color: 'good', message: message
+            }
+        }
+        failure {
+            echo "❌ Build failed for ${env.BRANCH_NAME}"
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
+
+// Helper functions
+def getBuildEnvironment() {
+    if (env.BRANCH_NAME == 'main') {
+        return 'production'
+    } else if (env.BRANCH_NAME == 'develop') {
+        return 'staging'
+    } else {
+        return 'development'
+    }
+}
+
+def getDeployUrl() {
+    if (env.BRANCH_NAME == 'main') {
+        return 'https://app.example.com'
+    } else if (env.BRANCH_NAME == 'develop') {
+        return 'https://staging.example.com'
+    } else {
+        return "https://dev-${env.BRANCH_NAME}.example.com"
+    }
+}
