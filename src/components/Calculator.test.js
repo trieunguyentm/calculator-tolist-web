@@ -3,51 +3,66 @@ import Calculator from './Calculator';
 
 describe('Calculator Component', () => {
   test('renders calculator display', () => {
-    render(<Calculator />);
-    const display = screen.getByText('0');
+    const { container } = render(<Calculator />);
+    const display = container.querySelector('.calculator-display');
     expect(display).toBeInTheDocument();
+    expect(display).toHaveTextContent('0');
   });
 
   test('displays digit when clicked', () => {
-    render(<Calculator />);
-    const button5 = screen.getByText('5');
+    const { container } = render(<Calculator />);
+    const buttons = screen.getAllByText('5');
+    const button5 = buttons.find(btn => btn.classList.contains('calculator-button'));
     fireEvent.click(button5);
     
-    const display = screen.getByText('5');
-    expect(display).toBeInTheDocument();
+    const display = container.querySelector('.calculator-display');
+    expect(display).toHaveTextContent('5');
   });
 
   test('performs addition', () => {
-    render(<Calculator />);
+    const { container } = render(<Calculator />);
     
-    fireEvent.click(screen.getByText('5'));
-    fireEvent.click(screen.getByText('+'));
-    fireEvent.click(screen.getByText('3'));
-    fireEvent.click(screen.getByText('='));
+    const button5 = screen.getAllByText('5').find(btn => btn.classList.contains('calculator-button'));
+    const buttonPlus = screen.getByText('+');
+    const button3 = screen.getByText('3');
+    const buttonEquals = screen.getByText('=');
     
-    const display = screen.getByText('8');
-    expect(display).toBeInTheDocument();
+    fireEvent.click(button5);
+    fireEvent.click(buttonPlus);
+    fireEvent.click(button3);
+    fireEvent.click(buttonEquals);
+    
+    const display = container.querySelector('.calculator-display');
+    expect(display).toHaveTextContent('8');
   });
 
   test('performs subtraction', () => {
-    render(<Calculator />);
+    const { container } = render(<Calculator />);
     
-    fireEvent.click(screen.getByText('9'));
-    fireEvent.click(screen.getByText('−'));
-    fireEvent.click(screen.getByText('4'));
-    fireEvent.click(screen.getByText('='));
+    const button9 = screen.getByText('9');
+    const buttonMinus = screen.getByText('−');
+    const button4 = screen.getByText('4');
+    const buttonEquals = screen.getByText('=');
     
-    const display = screen.getByText('5');
-    expect(display).toBeInTheDocument();
+    fireEvent.click(button9);
+    fireEvent.click(buttonMinus);
+    fireEvent.click(button4);
+    fireEvent.click(buttonEquals);
+    
+    const display = container.querySelector('.calculator-display');
+    expect(display).toHaveTextContent('5');
   });
 
   test('clears display', () => {
-    render(<Calculator />);
+    const { container } = render(<Calculator />);
     
-    fireEvent.click(screen.getByText('7'));
-    fireEvent.click(screen.getByText('AC'));
+    const button7 = screen.getByText('7');
+    const buttonAC = screen.getByText('AC');
     
-    const display = screen.getByText('0');
-    expect(display).toBeInTheDocument();
+    fireEvent.click(button7);
+    fireEvent.click(buttonAC);
+    
+    const display = container.querySelector('.calculator-display');
+    expect(display).toHaveTextContent('0');
   });
 });
