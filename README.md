@@ -150,6 +150,9 @@ chmod +x build.sh
 - [`JENKINS_PIPELINE_SETUP.md`](JENKINS_PIPELINE_SETUP.md) - Setup Pipeline Job
 - [`JENKINSFILE_GUIDE.md`](JENKINSFILE_GUIDE.md) - Cấu trúc Jenkinsfile
 - [`examples/`](examples/) - 5+ Jenkinsfile examples
+- [`GITHUB_WEBHOOK_GUIDE.md`](GITHUB_WEBHOOK_GUIDE.md) - ⭐ GitHub Webhook Integration
+- [`GIT_CREDENTIALS_GUIDE.md`](GIT_CREDENTIALS_GUIDE.md) - Git Credentials cho Private Repo
+- [`private-repo-sample/`](private-repo-sample/) - Sample private repository
 
 ## ✅ Test Coverage
 
