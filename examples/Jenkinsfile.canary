@@ -1,0 +1,350 @@
+// ============================================================
+// Jenkinsfile - Canary Deployment Pattern
+//
+// Nguyên lý:
+//   - Deploy version mới cho một phần nhỏ servers/users
+//   - Tăng dần tỷ lệ traffic: 5% → 25% → 50% → 100%
+//   - Monitor metrics sau mỗi bước, rollback nếu có lỗi
+//   - Lỗi chỉ ảnh hưởng nhóm nhỏ users (như "canary in coal mine")
+// ============================================================
+
+pipeline {
+    agent any
+
+    options {
+        timeout(time: 60, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    parameters {
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['staging', 'production'],
+            description: 'Target environment'
+        )
+        choice(
+            name: 'CANARY_STRATEGY',
+            choices: ['manual', 'auto'],
+            description: 'manual = người duyệt từng bước | auto = tự động tăng nếu metrics OK'
+        )
+        string(
+            name: 'INITIAL_WEIGHT',
+            defaultValue: '5',
+            description: 'Tỷ lệ traffic canary ban đầu (%) - mặc định 5%'
+        )
+        booleanParam(
+            name: 'ROLLBACK',
+            defaultValue: false,
+            description: 'Rollback canary — đưa 100% traffic về version cũ'
+        )
+    }
+
+    environment {
+        APP_NAME        = 'calculator-app'
+        DOCKER_REGISTRY = 'docker.io/yourusername'
+        IMAGE_TAG       = "${env.BUILD_NUMBER}"
+        NAMESPACE       = "${params.DEPLOY_ENV}"
+
+        // Tên deployments trong Kubernetes
+        STABLE_DEPLOYMENT = "${APP_NAME}-stable"
+        CANARY_DEPLOYMENT = "${APP_NAME}-canary"
+
+        // Ngưỡng lỗi cho phép (error rate %)
+        ERROR_RATE_THRESHOLD = '1'
+        // Ngưỡng latency cho phép (ms)
+        LATENCY_THRESHOLD = '500'
+    }
+
+    stages {
+
+        // ======================================================
+        // STAGE 1: CHECKOUT & BUILD
+        // ======================================================
+        stage('Checkout') {
+            steps {
+                cleanWs()
+                checkout scm
+            }
+        }
+
+        stage('Build & Test') {
+            agent {
+                docker { image 'node:18-alpine'; args '-u root'; reuseNode true }
+            }
+            steps {
+                sh 'npm ci'
+                sh 'npm test -- --watchAll=false'
+                sh 'npm run build'
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    env.CANARY_IMAGE = "${DOCKER_REGISTRY}/${APP_NAME}:canary-${IMAGE_TAG}"
+                    sh "docker build -t ${env.CANARY_IMAGE} ."
+                    echo "🐳 Canary image built: ${env.CANARY_IMAGE}"
+
+                    // sh "docker push ${env.CANARY_IMAGE}"
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 2: ROLLBACK (nếu được chọn)
+        // ======================================================
+        stage('Rollback Canary') {
+            when { expression { params.ROLLBACK } }
+            steps {
+                script {
+                    echo '⏪ Rolling back canary — routing 100% traffic to stable...'
+
+                    // Kubernetes: xoá canary deployment, trả 100% về stable
+                    // sh """
+                    //     kubectl delete deployment ${CANARY_DEPLOYMENT} -n ${NAMESPACE} --ignore-not-found
+                    //     kubectl patch virtualservice ${APP_NAME} -n ${NAMESPACE} \
+                    //         --type=json \
+                    //         -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":100},
+                    //              {"op":"replace","path":"/spec/http/0/route/1/weight","value":0}]'
+                    // """
+
+                    sh "echo 'Canary rolled back. 100% traffic → stable'"
+                    echo '✅ Rollback complete!'
+                    currentBuild.result = 'SUCCESS'
+                    return
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 3: DEPLOY CANARY (5% ban đầu)
+        // Chỉ deploy lên một số ít instances/pods
+        // ======================================================
+        stage('Deploy Canary (Initial)') {
+            when { expression { !params.ROLLBACK } }
+            steps {
+                script {
+                    def initialWeight = params.INITIAL_WEIGHT.toInteger()
+                    echo """
+🐦 Deploying CANARY version...
+   Image        : ${env.CANARY_IMAGE}
+   Traffic split: ${initialWeight}% canary / ${100 - initialWeight}% stable
+   Environment  : ${NAMESPACE}
+"""
+                    // ---- Kubernetes + Istio VirtualService ----
+                    // sh """
+                    //     # Tạo canary deployment (ít pods hơn stable)
+                    //     kubectl apply -f - <<EOF
+                    // apiVersion: apps/v1
+                    // kind: Deployment
+                    // metadata:
+                    //   name: ${CANARY_DEPLOYMENT}
+                    //   namespace: ${NAMESPACE}
+                    //   labels:
+                    //     app: ${APP_NAME}
+                    //     track: canary
+                    // spec:
+                    //   replicas: 1
+                    //   selector:
+                    //     matchLabels:
+                    //       app: ${APP_NAME}
+                    //       track: canary
+                    //   template:
+                    //     spec:
+                    //       containers:
+                    //       - name: ${APP_NAME}
+                    //         image: ${env.CANARY_IMAGE}
+                    // EOF
+                    //
+                    //     # Cấu hình traffic split qua Istio
+                    //     kubectl patch virtualservice ${APP_NAME} -n ${NAMESPACE} \
+                    //         --type=json \
+                    //         -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":${100 - initialWeight}},
+                    //              {"op":"replace","path":"/spec/http/0/route/1/weight","value":${initialWeight}}]'
+                    // """
+
+                    sh "echo 'Canary deployed with ${initialWeight}% traffic'"
+                    env.CURRENT_WEIGHT = initialWeight.toString()
+
+                    echo "✅ Canary is LIVE with ${initialWeight}% traffic"
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 4: CANARY PROGRESSION (tăng dần tỷ lệ)
+        // Mỗi bước: monitor metrics → tăng traffic nếu OK
+        // ======================================================
+        stage('Canary Progression') {
+            when { expression { !params.ROLLBACK } }
+            steps {
+                script {
+                    // Các mức traffic tăng dần
+                    def trafficSteps = [5, 25, 50, 100]
+
+                    for (def weight in trafficSteps) {
+                        echo "═══════════════════════════════════════"
+                        echo "  Canary traffic: ${weight}%"
+                        echo "═══════════════════════════════════════"
+
+                        // --- Thực hiện switch traffic ---
+                        switchCanaryTraffic(weight, CANARY_DEPLOYMENT, APP_NAME, NAMESPACE)
+
+                        // --- Monitor metrics trong N giây ---
+                        def monitorDuration = (weight == 100) ? 60 : 30
+                        echo "📊 Monitoring for ${monitorDuration}s at ${weight}% traffic..."
+                        sleep(time: monitorDuration, unit: 'SECONDS')
+
+                        // --- Kiểm tra metrics ---
+                        def metricsOk = checkMetrics(weight)
+
+                        if (!metricsOk) {
+                            echo "❌ Metrics threshold exceeded at ${weight}%! Initiating rollback..."
+                            rollbackCanary(CANARY_DEPLOYMENT, APP_NAME, NAMESPACE)
+                            error("Canary failed metrics check at ${weight}% traffic")
+                        }
+
+                        // --- Manual approval cho bước tiếp theo (nếu manual mode) ---
+                        if (params.CANARY_STRATEGY == 'manual' && weight < 100) {
+                            def nextWeight = trafficSteps[trafficSteps.indexOf(weight) + 1]
+                            timeout(time: 15, unit: 'MINUTES') {
+                                input(
+                                    message: "Canary at ${weight}% — metrics look good. Proceed to ${nextWeight}%?",
+                                    ok: "✅ Increase to ${nextWeight}%"
+                                )
+                            }
+                        }
+
+                        if (weight == 100) {
+                            echo '🎉 Canary promotion complete! 100% traffic on new version.'
+                        }
+                    }
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 5: PROMOTE — Dọn dẹp sau khi 100% thành công
+        // Xoá canary deployment, cập nhật stable deployment
+        // ======================================================
+        stage('Promote to Stable') {
+            when { expression { !params.ROLLBACK } }
+            steps {
+                script {
+                    echo '🏆 Promoting canary to stable...'
+
+                    // sh """
+                    //     # Cập nhật stable deployment với image mới
+                    //     kubectl set image deployment/${STABLE_DEPLOYMENT} \
+                    //         ${APP_NAME}=${env.CANARY_IMAGE} \
+                    //         -n ${NAMESPACE}
+                    //
+                    //     # Đợi rollout hoàn thành
+                    //     kubectl rollout status deployment/${STABLE_DEPLOYMENT} \
+                    //         -n ${NAMESPACE} --timeout=5m
+                    //
+                    //     # Xoá canary deployment
+                    //     kubectl delete deployment ${CANARY_DEPLOYMENT} \
+                    //         -n ${NAMESPACE} --ignore-not-found
+                    //
+                    //     # Reset traffic về 100% stable
+                    //     kubectl patch virtualservice ${APP_NAME} -n ${NAMESPACE} \
+                    //         --type=json \
+                    //         -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":100},
+                    //              {"op":"replace","path":"/spec/http/0/route/1/weight","value":0}]'
+                    // """
+
+                    sh "echo 'Stable deployment updated to ${env.CANARY_IMAGE}'"
+                    sh "echo 'Canary deployment removed'"
+                    echo '✅ Canary successfully promoted to stable!'
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo """
+╔════════════════════════════════════╗
+║       Canary Deployment Summary    ║
+╠════════════════════════════════════╣
+║  Build  : #${env.BUILD_NUMBER}
+║  Image  : ${APP_NAME}:canary-${IMAGE_TAG}
+║  Status : ${currentBuild.currentResult}
+╚════════════════════════════════════╝
+"""
+            cleanWs()
+        }
+        success { echo '✅ Canary deployment SUCCESSFUL!' }
+        failure {
+            echo '❌ Canary FAILED! Rollback was triggered automatically.'
+            echo '   Re-run with ROLLBACK=true to manually rollback.'
+        }
+    }
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+// Switch tỷ lệ traffic đến canary
+def switchCanaryTraffic(int canaryWeight, String canaryDeployment, String appName, String namespace) {
+    def stableWeight = 100 - canaryWeight
+    echo "🔀 Routing: ${stableWeight}% → stable | ${canaryWeight}% → canary"
+
+    // sh """
+    //     kubectl patch virtualservice ${appName} -n ${namespace} \
+    //         --type=json \
+    //         -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":${stableWeight}},
+    //              {"op":"replace","path":"/spec/http/0/route/1/weight","value":${canaryWeight}}]'
+    // """
+
+    sh "echo 'Traffic: ${stableWeight}% stable / ${canaryWeight}% canary'"
+}
+
+// Kiểm tra metrics (error rate, latency...)
+def checkMetrics(int weight) {
+    echo "📊 Checking metrics for canary at ${weight}% traffic..."
+
+    // Thực tế: query Prometheus/Datadog/CloudWatch
+    // def errorRate = sh(
+    //     script: """
+    //         kubectl exec -n monitoring prometheus-0 -- \
+    //             promtool query instant \
+    //             'rate(http_requests_total{status=~"5..",app="calculator-app"}[2m]) /
+    //              rate(http_requests_total{app="calculator-app"}[2m]) * 100' \
+    //             | grep -oP '[0-9.]+'
+    //     """,
+    //     returnStdout: true
+    // ).trim().toFloat()
+    //
+    // if (errorRate > env.ERROR_RATE_THRESHOLD.toFloat()) {
+    //     echo "ERROR RATE: ${errorRate}% (threshold: ${env.ERROR_RATE_THRESHOLD}%)"
+    //     return false
+    // }
+
+    // Simulate: 95% chance metrics are OK
+    def rand = new Random().nextInt(100)
+    if (rand < 5) {
+        echo '⚠️  Simulated metrics failure!'
+        return false
+    }
+
+    echo "✅ Metrics OK at ${weight}%: error_rate < ${env.ERROR_RATE_THRESHOLD}%, latency < ${env.LATENCY_THRESHOLD}ms"
+    return true
+}
+
+// Rollback canary về 0%
+def rollbackCanary(String canaryDeployment, String appName, String namespace) {
+    echo '⏪ Emergency rollback: routing 100% traffic back to stable...'
+    // sh """
+    //     kubectl patch virtualservice ${appName} -n ${namespace} \
+    //         --type=json \
+    //         -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":100},
+    //              {"op":"replace","path":"/spec/http/0/route/1/weight","value":0}]'
+    //     kubectl delete deployment ${canaryDeployment} -n ${namespace} --ignore-not-found
+    // """
+    sh "echo 'ROLLBACK: 100% traffic restored to stable'"
+}

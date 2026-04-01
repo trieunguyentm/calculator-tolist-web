@@ -1,0 +1,444 @@
+// ============================================================
+// Jenkinsfile - A/B Testing Deployment Pattern
+//
+// Nguyên lý:
+//   - Chạy 2 version (A và B) song song đồng thời
+//   - Phân chia traffic theo điều kiện: user segment, cookie, header...
+//   - Thu thập metrics và so sánh kết quả
+//   - Mục đích: ra quyết định dựa trên data (không phải cảm tính)
+//   - Khác Canary: tỷ lệ cố định (50/50), thời gian dài hơn, mục đích đo lường
+// ============================================================
+
+pipeline {
+    agent any
+
+    options {
+        timeout(time: 60, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timestamps()
+    }
+
+    parameters {
+        choice(
+            name: 'ACTION',
+            choices: ['deploy_ab', 'promote_a', 'promote_b', 'stop_ab'],
+            description: '''deploy_ab  = Deploy cả 2 versions A và B
+promote_a  = Chọn version A thắng → full rollout
+promote_b  = Chọn version B thắng → full rollout
+stop_ab    = Dừng experiment, giữ nguyên version cũ'''
+        )
+        string(
+            name: 'VERSION_A_IMAGE',
+            defaultValue: '',
+            description: 'Docker image cho version A (bỏ trống = dùng build hiện tại)'
+        )
+        string(
+            name: 'VERSION_B_IMAGE',
+            defaultValue: '',
+            description: 'Docker image cho version B (tag mới nhất)'
+        )
+        string(
+            name: 'TRAFFIC_SPLIT_A',
+            defaultValue: '50',
+            description: 'Phần trăm traffic cho version A (mặc định 50%)'
+        )
+        choice(
+            name: 'SPLIT_STRATEGY',
+            choices: ['random', 'cookie', 'header', 'user_id', 'geo'],
+            description: '''Cách phân chia traffic:
+random  = Random 50/50
+cookie  = Dựa theo ab_test cookie
+header  = Dựa theo X-AB-Group header
+user_id = Dựa theo user ID (even=A, odd=B)
+geo     = Dựa theo địa lý (VN=A, US=B)'''
+        )
+        string(
+            name: 'EXPERIMENT_NAME',
+            defaultValue: "ab-test-${new Date().format('yyyyMMdd')}",
+            description: 'Tên experiment để track trong analytics'
+        )
+        string(
+            name: 'DEPLOY_ENV',
+            defaultValue: 'production',
+            description: 'Target environment'
+        )
+    }
+
+    environment {
+        APP_NAME        = 'calculator-app'
+        DOCKER_REGISTRY = 'docker.io/yourusername'
+        IMAGE_TAG       = "${env.BUILD_NUMBER}"
+        NAMESPACE       = "${params.DEPLOY_ENV}"
+
+        DEPLOYMENT_A    = "${APP_NAME}-version-a"
+        DEPLOYMENT_B    = "${APP_NAME}-version-b"
+        SERVICE_NAME    = "${APP_NAME}"
+
+        // Analytics / Metrics endpoints
+        ANALYTICS_API   = 'http://analytics.example.com/api'
+        METRICS_API     = 'http://prometheus.example.com/api/v1'
+    }
+
+    stages {
+
+        // ======================================================
+        // STAGE 1: CHECKOUT & BUILD
+        // ======================================================
+        stage('Checkout') {
+            when {
+                expression { params.ACTION == 'deploy_ab' }
+            }
+            steps {
+                cleanWs()
+                checkout scm
+            }
+        }
+
+        stage('Build Version B (New)') {
+            when {
+                allOf {
+                    expression { params.ACTION == 'deploy_ab' }
+                    expression { params.VERSION_B_IMAGE == '' }
+                }
+            }
+            agent {
+                docker { image 'node:18-alpine'; args '-u root'; reuseNode true }
+            }
+            steps {
+                sh 'npm ci'
+                sh 'npm test -- --watchAll=false'
+                sh 'npm run build'
+
+                script {
+                    env.IMAGE_B = "${DOCKER_REGISTRY}/${APP_NAME}:b-${IMAGE_TAG}"
+                    sh "docker build -t ${env.IMAGE_B} ."
+                    echo "🐳 Version B image: ${env.IMAGE_B}"
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 2: DEPLOY A/B VERSIONS
+        // Deploy cả 2 versions song song
+        // ======================================================
+        stage('Deploy A/B Versions') {
+            when {
+                expression { params.ACTION == 'deploy_ab' }
+            }
+            steps {
+                script {
+                    def imageA = params.VERSION_A_IMAGE ?: "${DOCKER_REGISTRY}/${APP_NAME}:stable"
+                    def imageB = params.VERSION_B_IMAGE ?: env.IMAGE_B
+                    def weightA = params.TRAFFIC_SPLIT_A.toInteger()
+                    def weightB = 100 - weightA
+
+                    echo """
+╔════════════════════════════════════════════╗
+║           A/B Test Configuration           ║
+╠════════════════════════════════════════════╣
+║  Experiment : ${params.EXPERIMENT_NAME}
+║  Version A  : ${imageA} (${weightA}% traffic)
+║  Version B  : ${imageB} (${weightB}% traffic)
+║  Strategy   : ${params.SPLIT_STRATEGY}
+║  Environment: ${NAMESPACE}
+╚════════════════════════════════════════════╝
+"""
+                    // ---- Deploy Version A ----
+                    echo "🅰️  Deploying Version A (${weightA}% traffic)..."
+                    deployVersion('a', imageA, NAMESPACE, DEPLOYMENT_A)
+
+                    // ---- Deploy Version B ----
+                    echo "🅱️  Deploying Version B (${weightB}% traffic)..."
+                    deployVersion('b', imageB, NAMESPACE, DEPLOYMENT_B)
+
+                    // ---- Configure traffic splitting ----
+                    echo "⚖️  Configuring traffic split: A=${weightA}% | B=${weightB}%"
+                    configureTrafficSplit(weightA, weightB, params.SPLIT_STRATEGY)
+
+                    // ---- Register experiment in analytics ----
+                    registerExperiment(params.EXPERIMENT_NAME, imageA, imageB, weightA, weightB)
+
+                    env.IMAGE_A = imageA
+                    env.IMAGE_B_FINAL = imageB
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 3: COLLECT METRICS
+        // Đợi đủ traffic sau đó thu thập metrics
+        // ======================================================
+        stage('Collect Metrics') {
+            when {
+                expression { params.ACTION == 'deploy_ab' }
+            }
+            steps {
+                script {
+                    echo '📊 Waiting for traffic to accumulate metrics...'
+                    echo '   (In production, this would run for hours/days)'
+
+                    // Simulate waiting for initial metrics
+                    sleep(time: 5, unit: 'SECONDS')
+
+                    def metrics = collectMetrics()
+
+                    echo """
+╔════════════════════════════════════════════╗
+║           A/B Test Metrics (Live)          ║
+╠════════════════════════════════════════════╣
+║  Version A:
+║    • Requests/sec : ${metrics.a.rps}
+║    • Error rate   : ${metrics.a.errorRate}%
+║    • Avg latency  : ${metrics.a.latency}ms
+║    • Conversion   : ${metrics.a.conversion}%
+╠════════════════════════════════════════════╣
+║  Version B:
+║    • Requests/sec : ${metrics.b.rps}
+║    • Error rate   : ${metrics.b.errorRate}%
+║    • Avg latency  : ${metrics.b.latency}ms
+║    • Conversion   : ${metrics.b.conversion}%
+╠════════════════════════════════════════════╣
+║  Winner (by conversion): ${metrics.a.conversion > metrics.b.conversion ? 'Version A 🏆' : 'Version B 🏆'}
+╚════════════════════════════════════════════╝
+
+Next steps:
+  • Monitor for 24-48 hours to get statistically significant results
+  • Re-run pipeline with ACTION=promote_a or promote_b to conclude
+"""
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 4: PROMOTE VERSION A (Version A thắng)
+        // Switch 100% traffic về version A, xoá version B
+        // ======================================================
+        stage('Promote Version A') {
+            when {
+                expression { params.ACTION == 'promote_a' }
+            }
+            steps {
+                script {
+                    echo '🏆 Version A wins! Promoting to 100% traffic...'
+
+                    // sh """
+                    //     # Scale up version A
+                    //     kubectl scale deployment ${DEPLOYMENT_A} \
+                    //         --replicas=${params.REPLICAS} -n ${NAMESPACE}
+                    //
+                    //     # Route 100% traffic to A
+                    //     kubectl patch virtualservice ${APP_NAME} -n ${NAMESPACE} \
+                    //         --type=json \
+                    //         -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":100},
+                    //              {"op":"replace","path":"/spec/http/0/route/1/weight","value":0}]'
+                    //
+                    //     # Clean up version B
+                    //     kubectl delete deployment ${DEPLOYMENT_B} -n ${NAMESPACE} --ignore-not-found
+                    // """
+
+                    sh "echo 'Version A promoted: 100% traffic'"
+                    sh "echo 'Version B removed'"
+
+                    echo '✅ A/B Test concluded. Version A is now serving 100% of traffic.'
+                    concludeExperiment(params.EXPERIMENT_NAME, 'A')
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 5: PROMOTE VERSION B (Version B thắng)
+        // Switch 100% traffic về version B, xoá version A
+        // ======================================================
+        stage('Promote Version B') {
+            when {
+                expression { params.ACTION == 'promote_b' }
+            }
+            steps {
+                script {
+                    echo '🏆 Version B wins! Promoting to 100% traffic...'
+
+                    // sh """
+                    //     # Scale up version B, then rename to stable
+                    //     kubectl scale deployment ${DEPLOYMENT_B} \
+                    //         --replicas=${params.REPLICAS} -n ${NAMESPACE}
+                    //
+                    //     kubectl patch virtualservice ${APP_NAME} -n ${NAMESPACE} \
+                    //         --type=json \
+                    //         -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":0},
+                    //              {"op":"replace","path":"/spec/http/0/route/1/weight","value":100}]'
+                    //
+                    //     # Clean up version A
+                    //     kubectl delete deployment ${DEPLOYMENT_A} -n ${NAMESPACE} --ignore-not-found
+                    // """
+
+                    sh "echo 'Version B promoted: 100% traffic'"
+                    sh "echo 'Version A removed'"
+
+                    echo '✅ A/B Test concluded. Version B is now serving 100% of traffic.'
+                    concludeExperiment(params.EXPERIMENT_NAME, 'B')
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 6: STOP A/B TEST
+        // Dừng experiment, giữ nguyên version A (stable)
+        // ======================================================
+        stage('Stop A/B Test') {
+            when {
+                expression { params.ACTION == 'stop_ab' }
+            }
+            steps {
+                script {
+                    echo '🛑 Stopping A/B test — reverting to stable (Version A)...'
+
+                    // sh """
+                    //     kubectl delete deployment ${DEPLOYMENT_B} -n ${NAMESPACE} --ignore-not-found
+                    //     kubectl patch virtualservice ${APP_NAME} -n ${NAMESPACE} \
+                    //         --type=json \
+                    //         -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":100},
+                    //              {"op":"replace","path":"/spec/http/0/route/1/weight","value":0}]'
+                    // """
+
+                    sh "echo 'A/B test stopped. Stable (A) serving 100%'"
+                    concludeExperiment(params.EXPERIMENT_NAME, 'stopped')
+                    echo '✅ A/B test stopped. Traffic back to stable.'
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo """
+╔════════════════════════════════════╗
+║       A/B Testing Summary          ║
+╠════════════════════════════════════╣
+║  Experiment : ${params.EXPERIMENT_NAME}
+║  Action     : ${params.ACTION}
+║  Split      : A=${params.TRAFFIC_SPLIT_A}% / B=${100 - params.TRAFFIC_SPLIT_A.toInteger()}%
+║  Strategy   : ${params.SPLIT_STRATEGY}
+║  Status     : ${currentBuild.currentResult}
+╚════════════════════════════════════╝
+"""
+            cleanWs()
+        }
+        success { echo '✅ A/B test pipeline completed!' }
+        failure { echo '❌ A/B test pipeline failed!' }
+    }
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+def deployVersion(String version, String image, String namespace, String deploymentName) {
+    echo "  → Deploying version-${version}: ${image}"
+
+    // sh """
+    //     kubectl apply -f - <<EOF
+    // apiVersion: apps/v1
+    // kind: Deployment
+    // metadata:
+    //   name: ${deploymentName}
+    //   namespace: ${namespace}
+    //   labels:
+    //     app: ${env.APP_NAME}
+    //     version: ${version}
+    // spec:
+    //   replicas: 2
+    //   selector:
+    //     matchLabels:
+    //       app: ${env.APP_NAME}
+    //       version: ${version}
+    //   template:
+    //     metadata:
+    //       labels:
+    //         app: ${env.APP_NAME}
+    //         version: ${version}
+    //     spec:
+    //       containers:
+    //       - name: ${env.APP_NAME}
+    //         image: ${image}
+    //         ports:
+    //         - containerPort: 3000
+    //         env:
+    //         - name: AB_VERSION
+    //           value: "${version}"
+    // EOF
+    //     kubectl rollout status deployment/${deploymentName} -n ${namespace} --timeout=5m
+    // """
+
+    sh "echo 'Deployed version-${version} (${image}) to ${namespace}'"
+}
+
+def configureTrafficSplit(int weightA, int weightB, String strategy) {
+    // Istio VirtualService with header/cookie-based routing
+    // sh """
+    //     kubectl apply -f - <<EOF
+    // apiVersion: networking.istio.io/v1alpha3
+    // kind: VirtualService
+    // metadata:
+    //   name: ${env.APP_NAME}
+    //   namespace: ${env.NAMESPACE}
+    // spec:
+    //   hosts:
+    //   - ${env.APP_NAME}
+    //   http:
+    //   - match:
+    //     - headers:
+    //         x-ab-group:
+    //           exact: "b"
+    //     route:
+    //     - destination:
+    //         host: ${env.APP_NAME}
+    //         subset: version-b
+    //   - route:
+    //     - destination:
+    //         host: ${env.APP_NAME}
+    //         subset: version-a
+    //       weight: ${weightA}
+    //     - destination:
+    //         host: ${env.APP_NAME}
+    //         subset: version-b
+    //       weight: ${weightB}
+    // EOF
+    // """
+
+    sh "echo 'Traffic split configured: A=${weightA}% B=${weightB}% via ${strategy}'"
+}
+
+def registerExperiment(String name, String imageA, String imageB, int weightA, int weightB) {
+    // sh """
+    //     curl -X POST ${env.ANALYTICS_API}/experiments \
+    //         -H 'Content-Type: application/json' \
+    //         -d '{
+    //             "name": "${name}",
+    //             "version_a": "${imageA}",
+    //             "version_b": "${imageB}",
+    //             "weight_a": ${weightA},
+    //             "weight_b": ${weightB},
+    //             "started_at": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"
+    //         }'
+    // """
+    echo "📊 Experiment '${name}' registered in analytics"
+}
+
+def collectMetrics() {
+    // Thực tế: query Prometheus/Datadog/Grafana API
+    // def resultA = sh(script: "curl -s '${env.METRICS_API}/query?query=...'", returnStdout: true)
+
+    return [
+        a: [ rps: 120, errorRate: 0.5, latency: 145, conversion: 3.2 ],
+        b: [ rps: 118, errorRate: 0.3, latency: 132, conversion: 4.1 ]
+    ]
+}
+
+def concludeExperiment(String name, String winner) {
+    // sh """
+    //     curl -X PATCH ${env.ANALYTICS_API}/experiments/${name} \
+    //         -H 'Content-Type: application/json' \
+    //         -d '{"winner": "${winner}", "ended_at": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}'
+    // """
+    echo "📊 Experiment '${name}' concluded. Winner: ${winner}"
+}

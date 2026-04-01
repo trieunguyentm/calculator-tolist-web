@@ -1,0 +1,378 @@
+// ============================================================
+// Jenkinsfile - Blue/Green Deployment Pattern
+//
+// Nguyên lý:
+//   - Duy trì 2 môi trường BLUE và GREEN giống hệt nhau
+//   - Deploy version mới vào môi trường INACTIVE
+//   - Switch toàn bộ traffic sang môi trường mới
+//   - Giữ môi trường cũ làm rollback
+// ============================================================
+
+pipeline {
+    agent any
+
+    options {
+        timeout(time: 45, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    // ----------------------------------------------------------
+    // Các tham số để điều khiển deployment
+    // ----------------------------------------------------------
+    parameters {
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['staging', 'production'],
+            description: 'Chọn môi trường deploy'
+        )
+        booleanParam(
+            name: 'AUTO_SWITCH_TRAFFIC',
+            defaultValue: false,
+            description: 'Tự động switch traffic sau khi smoke test pass (không cần approval)?'
+        )
+        booleanParam(
+            name: 'ROLLBACK',
+            defaultValue: false,
+            description: 'Rollback về version trước? (switch traffic ngược lại)'
+        )
+    }
+
+    environment {
+        APP_NAME        = 'calculator-app'
+        DOCKER_REGISTRY = 'docker.io/yourusername'
+        IMAGE_TAG       = "${env.BUILD_NUMBER}"
+
+        // Simulate load balancer / DNS endpoint
+        // Thực tế: thay bằng URL thật của load balancer API
+        LOAD_BALANCER_API = 'http://load-balancer.example.com/api'
+
+        // Health check URL template — %s sẽ được thay bằng 'blue' hoặc 'green'
+        HEALTH_CHECK_URL  = 'http://%s.example.com/health'
+
+        // File ghi trạng thái môi trường nào đang active
+        STATE_FILE        = '/var/jenkins/bluegreen-state.txt'
+    }
+
+    stages {
+
+        // ======================================================
+        // STAGE 1: CHECKOUT
+        // ======================================================
+        stage('Checkout') {
+            steps {
+                cleanWs()
+                checkout scm
+                echo "📥 Checked out commit: ${sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()}"
+            }
+        }
+
+        // ======================================================
+        // STAGE 2: BUILD & TEST
+        // ======================================================
+        stage('Build & Test') {
+            agent {
+                docker { image 'node:18-alpine'; args '-u root'; reuseNode true }
+            }
+            steps {
+                echo '📦 Installing dependencies...'
+                sh 'npm ci'
+
+                echo '🧪 Running tests...'
+                sh 'npm test -- --watchAll=false'
+
+                echo '🔨 Building application...'
+                sh 'npm run build'
+            }
+        }
+
+        // ======================================================
+        // STAGE 3: BUILD DOCKER IMAGE
+        // ======================================================
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    def fullImage = "${DOCKER_REGISTRY}/${APP_NAME}:${IMAGE_TAG}"
+                    def latestImage = "${DOCKER_REGISTRY}/${APP_NAME}:latest"
+
+                    echo "🐳 Building Docker image: ${fullImage}"
+                    sh "docker build -t ${fullImage} -t ${latestImage} ."
+
+                    env.FULL_IMAGE = fullImage
+
+                    // Push lên registry (bỏ comment khi có credentials)
+                    // withCredentials([usernamePassword(credentialsId: 'docker-hub-credentials',
+                    //         usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                    //     sh "echo ${DOCKER_PASS} | docker login -u ${DOCKER_USER} --password-stdin"
+                    //     sh "docker push ${fullImage}"
+                    //     sh "docker push ${latestImage}"
+                    // }
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 4: XÁC ĐỊNH MÔI TRƯỜNG ACTIVE/INACTIVE
+        // Đọc state file để biết Blue hay Green đang active
+        // ======================================================
+        stage('Determine Active Environment') {
+            when { expression { !params.ROLLBACK } }
+            steps {
+                script {
+                    // Đọc trạng thái hiện tại từ state file
+                    // Nếu không có state file → mặc định Blue là active
+                    def currentActive = sh(
+                        script: "cat ${STATE_FILE} 2>/dev/null || echo 'blue'",
+                        returnStdout: true
+                    ).trim()
+
+                    if (currentActive == 'blue') {
+                        env.ACTIVE_ENV   = 'blue'
+                        env.INACTIVE_ENV = 'green'
+                    } else {
+                        env.ACTIVE_ENV   = 'green'
+                        env.INACTIVE_ENV = 'blue'
+                    }
+
+                    echo """
+╔══════════════════════════════════════╗
+║     Blue/Green Environment State     ║
+╠══════════════════════════════════════╣
+║  ACTIVE (serving traffic) : ${env.ACTIVE_ENV.toUpperCase().padRight(6)} ║
+║  INACTIVE (deploy target) : ${env.INACTIVE_ENV.toUpperCase().padRight(6)} ║
+║  New image                : ${IMAGE_TAG.padRight(6)} ║
+╚══════════════════════════════════════╝
+"""
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 5: DEPLOY VÀO MÔI TRƯỜNG INACTIVE
+        // Version mới được deploy vào môi trường KHÔNG nhận traffic
+        // ======================================================
+        stage('Deploy to Inactive Environment') {
+            when { expression { !params.ROLLBACK } }
+            steps {
+                script {
+                    echo "🚀 Deploying ${APP_NAME}:${IMAGE_TAG} to ${env.INACTIVE_ENV.toUpperCase()} environment..."
+                    echo "   Active env (current production): ${env.ACTIVE_ENV.toUpperCase()}"
+                    echo "   Inactive env (deploy target)   : ${env.INACTIVE_ENV.toUpperCase()}"
+
+                    // ---- Kubernetes example ----
+                    // sh """
+                    //     kubectl set image deployment/${APP_NAME}-${env.INACTIVE_ENV} \
+                    //         ${APP_NAME}=${FULL_IMAGE} \
+                    //         --namespace=${params.DEPLOY_ENV}
+                    //     kubectl rollout status deployment/${APP_NAME}-${env.INACTIVE_ENV} \
+                    //         --namespace=${params.DEPLOY_ENV} \
+                    //         --timeout=5m
+                    // """
+
+                    // ---- Docker Compose example ----
+                    // sh """
+                    //     export IMAGE_TAG=${IMAGE_TAG}
+                    //     docker-compose -f docker-compose.${env.INACTIVE_ENV}.yml up -d --force-recreate
+                    // """
+
+                    // ---- Simulate deploy ----
+                    sh "echo 'Deployed ${APP_NAME}:${IMAGE_TAG} to ${env.INACTIVE_ENV}'"
+                    sleep(time: 3, unit: 'SECONDS')
+
+                    echo "✅ Deployment to ${env.INACTIVE_ENV.toUpperCase()} completed!"
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 6: SMOKE TEST (test môi trường inactive)
+        // Kiểm tra version mới hoạt động trước khi switch traffic
+        // ======================================================
+        stage('Smoke Test (Inactive)') {
+            when { expression { !params.ROLLBACK } }
+            steps {
+                script {
+                    def targetUrl = sprintf(env.HEALTH_CHECK_URL, env.INACTIVE_ENV)
+                    echo "🧪 Running smoke tests against ${env.INACTIVE_ENV.toUpperCase()}..."
+                    echo "   URL: ${targetUrl}"
+
+                    // Thực tế: gọi health check endpoint, chạy integration tests
+                    // sh """
+                    //     for i in 1 2 3 4 5; do
+                    //         STATUS=\$(curl -s -o /dev/null -w '%{http_code}' ${targetUrl})
+                    //         if [ "\$STATUS" = "200" ]; then
+                    //             echo "Health check passed (attempt \$i)"
+                    //             exit 0
+                    //         fi
+                    //         echo "Attempt \$i failed (status: \$STATUS), retrying..."
+                    //         sleep 10
+                    //     done
+                    //     echo "Health check failed after 5 attempts!"
+                    //     exit 1
+                    // """
+
+                    // Simulate smoke test
+                    sh "echo 'Smoke test OK: ${env.INACTIVE_ENV} is healthy'"
+                    echo "✅ Smoke tests passed on ${env.INACTIVE_ENV.toUpperCase()}"
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 7: APPROVAL TRƯỚC KHI SWITCH TRAFFIC
+        // Cho phép QA/Manager review trước khi go-live
+        // ======================================================
+        stage('Approval: Switch Traffic') {
+            when {
+                allOf {
+                    expression { !params.ROLLBACK }
+                    expression { !params.AUTO_SWITCH_TRAFFIC }
+                }
+            }
+            steps {
+                script {
+                    def targetUrl = sprintf(env.HEALTH_CHECK_URL, env.INACTIVE_ENV)
+                    timeout(time: 30, unit: 'MINUTES') {
+                        input(
+                            message: """
+⚠️  Ready to switch traffic to ${env.INACTIVE_ENV.toUpperCase()}?
+
+  • New version  : ${APP_NAME}:${IMAGE_TAG}
+  • Preview URL  : ${targetUrl}
+  • Current live : ${env.ACTIVE_ENV.toUpperCase()}
+  • Target live  : ${env.INACTIVE_ENV.toUpperCase()}
+
+Review the new version at the preview URL before approving.
+""",
+                            ok: "✅ Switch Traffic to ${env.INACTIVE_ENV.toUpperCase()}",
+                            submitter: 'admin,release-manager'
+                        )
+                    }
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 8: SWITCH TRAFFIC (Blue ↔ Green)
+        // Chuyển toàn bộ traffic sang môi trường mới
+        // ======================================================
+        stage('Switch Traffic') {
+            when { expression { !params.ROLLBACK } }
+            steps {
+                script {
+                    echo "🔀 Switching traffic: ${env.ACTIVE_ENV.toUpperCase()} → ${env.INACTIVE_ENV.toUpperCase()}"
+
+                    // ---- Load Balancer API example ----
+                    // sh """
+                    //     curl -X POST ${LOAD_BALANCER_API}/switch \
+                    //         -H 'Content-Type: application/json' \
+                    //         -d '{"target": "${env.INACTIVE_ENV}"}'
+                    // """
+
+                    // ---- Kubernetes Service example ----
+                    // sh """
+                    //     kubectl patch service ${APP_NAME} \
+                    //         -p '{"spec":{"selector":{"slot":"${env.INACTIVE_ENV}"}}}' \
+                    //         --namespace=${params.DEPLOY_ENV}
+                    // """
+
+                    // ---- AWS Route53 / ALB example ----
+                    // sh """
+                    //     aws elbv2 modify-rule \
+                    //         --rule-arn ${ALB_RULE_ARN} \
+                    //         --actions Type=forward,TargetGroupArn=${env.INACTIVE_ENV == 'blue' ? BLUE_TG_ARN : GREEN_TG_ARN}
+                    // """
+
+                    // Simulate switch
+                    sh "echo 'Traffic switched to ${env.INACTIVE_ENV}'"
+
+                    // Cập nhật state file
+                    sh "echo '${env.INACTIVE_ENV}' > ${STATE_FILE} || true"
+
+                    echo "✅ Traffic now flowing to ${env.INACTIVE_ENV.toUpperCase()}"
+                    echo "   Old active (${env.ACTIVE_ENV.toUpperCase()}) kept on standby for rollback"
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 9: ROLLBACK (nếu params.ROLLBACK = true)
+        // Switch traffic ngược lại về môi trường cũ
+        // ======================================================
+        stage('Rollback') {
+            when { expression { params.ROLLBACK } }
+            steps {
+                script {
+                    def currentActive = sh(
+                        script: "cat ${STATE_FILE} 2>/dev/null || echo 'green'",
+                        returnStdout: true
+                    ).trim()
+                    def rollbackTarget = currentActive == 'blue' ? 'green' : 'blue'
+
+                    echo "⏪ Rolling back: ${currentActive.toUpperCase()} → ${rollbackTarget.toUpperCase()}"
+
+                    // sh """
+                    //     kubectl patch service ${APP_NAME} \
+                    //         -p '{"spec":{"selector":{"slot":"${rollbackTarget}"}}}' \
+                    //         --namespace=${params.DEPLOY_ENV}
+                    // """
+
+                    sh "echo 'Rollback: traffic switched to ${rollbackTarget}'"
+                    sh "echo '${rollbackTarget}' > ${STATE_FILE} || true"
+
+                    echo "✅ Rollback complete! Traffic now on ${rollbackTarget.toUpperCase()}"
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 10: POST-SWITCH VERIFICATION
+        // ======================================================
+        stage('Post-Switch Verification') {
+            when { expression { !params.ROLLBACK } }
+            steps {
+                script {
+                    echo '🔍 Verifying production after traffic switch...'
+                    sleep(time: 5, unit: 'SECONDS')
+
+                    // sh """
+                    //     STATUS=\$(curl -s -o /dev/null -w '%{http_code}' http://production.example.com/health)
+                    //     if [ "\$STATUS" != "200" ]; then
+                    //         echo "Production health check failed! Consider rollback."
+                    //         exit 1
+                    //     fi
+                    // """
+
+                    sh "echo 'Production health check: OK'"
+                    echo "✅ Production is healthy on ${env.INACTIVE_ENV.toUpperCase()}"
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                def activeNow = sh(
+                    script: "cat ${STATE_FILE} 2>/dev/null || echo 'unknown'",
+                    returnStdout: true
+                ).trim()
+
+                echo """
+╔══════════════════════════════════════╗
+║         Blue/Green Summary           ║
+╠══════════════════════════════════════╣
+║  Build    : #${env.BUILD_NUMBER}
+║  Status   : ${currentBuild.currentResult}
+║  Active   : ${activeNow.toUpperCase()}
+║  Image    : ${APP_NAME}:${IMAGE_TAG}
+╚══════════════════════════════════════╝
+"""
+            }
+            cleanWs()
+        }
+        success { echo '✅ Blue/Green deployment SUCCESSFUL!' }
+        failure { echo '❌ Pipeline FAILED! Consider rollback by re-running with ROLLBACK=true' }
+    }
+}

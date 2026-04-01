@@ -1,0 +1,379 @@
+// ============================================================
+// Jenkinsfile - Feature Toggle (Feature Flag) Pattern
+//
+// Nguyên lý:
+//   - Deploy code mới nhưng feature bị ẩn (disabled by default)
+//   - Bật/tắt feature qua config/API — KHÔNG cần deploy lại
+//   - Kiểm soát ai thấy feature mới: internal → beta → everyone
+//   - Tách biệt "deploy" và "release" thành 2 sự kiện riêng
+// ============================================================
+
+pipeline {
+    agent any
+
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    parameters {
+        choice(
+            name: 'ACTION',
+            choices: ['deploy', 'toggle_flag', 'rollout', 'rollback_flag'],
+            description: '''deploy        = Deploy code với feature hidden
+toggle_flag   = Bật/tắt feature flag cho user group
+rollout       = Tăng dần tỷ lệ users thấy feature
+rollback_flag = Tắt flag ngay lập tức (emergency)'''
+        )
+        string(
+            name: 'FEATURE_FLAG_NAME',
+            defaultValue: 'new-calculator-ui',
+            description: 'Tên feature flag cần thao tác'
+        )
+        choice(
+            name: 'FLAG_ACTION',
+            choices: ['enable', 'disable'],
+            description: 'Bật hay tắt flag (dùng với ACTION=toggle_flag)'
+        )
+        choice(
+            name: 'TARGET_GROUP',
+            choices: ['internal', 'beta', 'percentage', 'everyone'],
+            description: '''internal   = Chỉ internal users (QA, Dev)
+beta       = Beta users program
+percentage = % ngẫu nhiên của users
+everyone   = Toàn bộ users'''
+        )
+        string(
+            name: 'ROLLOUT_PERCENTAGE',
+            defaultValue: '10',
+            description: 'Phần trăm users thấy feature (dùng khi TARGET_GROUP=percentage)'
+        )
+        string(
+            name: 'DEPLOY_ENV',
+            defaultValue: 'production',
+            description: 'Target environment'
+        )
+    }
+
+    environment {
+        APP_NAME        = 'calculator-app'
+        DOCKER_REGISTRY = 'docker.io/yourusername'
+        IMAGE_TAG       = "${env.BUILD_NUMBER}"
+        NAMESPACE       = "${params.DEPLOY_ENV}"
+
+        // Feature Flag Service (LaunchDarkly / Unleash / custom)
+        FLAG_SERVICE_URL = 'http://flags.example.com/api'
+        FLAG_SERVICE_TOKEN = credentials('feature-flag-api-token')
+    }
+
+    stages {
+
+        // ======================================================
+        // STAGE 1: CHECKOUT & BUILD (chỉ khi ACTION=deploy)
+        // ======================================================
+        stage('Checkout') {
+            when { expression { params.ACTION == 'deploy' } }
+            steps {
+                cleanWs()
+                checkout scm
+                echo "📥 Commit: ${sh(script:'git rev-parse --short HEAD', returnStdout:true).trim()}"
+            }
+        }
+
+        stage('Build & Test') {
+            when { expression { params.ACTION == 'deploy' } }
+            agent {
+                docker { image 'node:18-alpine'; args '-u root'; reuseNode true }
+            }
+            steps {
+                echo '📦 Installing dependencies...'
+                sh 'npm ci'
+
+                echo '🧪 Running tests...'
+                sh 'npm test -- --watchAll=false'
+
+                echo '🔨 Building application...'
+                sh 'npm run build'
+
+                // Kiểm tra feature flags trong code
+                echo '🔍 Scanning feature flags in codebase...'
+                scanFeatureFlags()
+            }
+        }
+
+        stage('Build Docker Image') {
+            when { expression { params.ACTION == 'deploy' } }
+            steps {
+                script {
+                    env.NEW_IMAGE = "${DOCKER_REGISTRY}/${APP_NAME}:${IMAGE_TAG}"
+                    sh "docker build -t ${env.NEW_IMAGE} ."
+                    // sh "docker push ${env.NEW_IMAGE}"
+                    echo "🐳 Image: ${env.NEW_IMAGE}"
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 2: DEPLOY (với feature flags TẮT mặc định)
+        // Code mới được deploy nhưng feature chưa hiển thị
+        // ======================================================
+        stage('Deploy with Flags Disabled') {
+            when { expression { params.ACTION == 'deploy' } }
+            steps {
+                script {
+                    echo """
+🚀 Deploying ${APP_NAME}:${IMAGE_TAG} to ${NAMESPACE}
+   ⚠️  Feature '${params.FEATURE_FLAG_NAME}' will be DISABLED by default
+   ✅  Existing users see NO changes
+   🧪  Internal team can test via flag override
+"""
+                    // ---- Kubernetes deploy ----
+                    // sh """
+                    //     kubectl set image deployment/${APP_NAME} \
+                    //         ${APP_NAME}=${env.NEW_IMAGE} \
+                    //         --namespace=${NAMESPACE}
+                    //     kubectl rollout status deployment/${APP_NAME} \
+                    //         --namespace=${NAMESPACE} --timeout=5m
+                    // """
+
+                    sh "echo 'Deployed ${env.NEW_IMAGE} to ${NAMESPACE}'"
+
+                    // Đảm bảo flag ở trạng thái tắt sau deploy
+                    setFlag(params.FEATURE_FLAG_NAME, false, 'everyone', 0)
+
+                    echo """
+✅ Deployment complete!
+   Code is live but feature is HIDDEN.
+   Next steps:
+   1. Run ACTION=toggle_flag + TARGET_GROUP=internal to test internally
+   2. Run ACTION=toggle_flag + TARGET_GROUP=beta for beta users
+   3. Run ACTION=rollout to gradually increase percentage
+   4. Run ACTION=toggle_flag + TARGET_GROUP=everyone for full release
+"""
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 3: TOGGLE FLAG
+        // Bật/tắt feature cho nhóm user cụ thể
+        // KHÔNG cần deploy lại
+        // ======================================================
+        stage('Toggle Feature Flag') {
+            when { expression { params.ACTION == 'toggle_flag' } }
+            steps {
+                script {
+                    def isEnable   = params.FLAG_ACTION == 'enable'
+                    def group      = params.TARGET_GROUP
+                    def percentage = params.ROLLOUT_PERCENTAGE.toInteger()
+
+                    echo """
+🎚️  Feature Flag Operation
+   Flag       : ${params.FEATURE_FLAG_NAME}
+   Action     : ${params.FLAG_ACTION.toUpperCase()}
+   Target     : ${group}${group == 'percentage' ? " (${percentage}%)" : ''}
+   Environment: ${NAMESPACE}
+"""
+                    // Approval nếu bật cho everyone
+                    if (isEnable && group == 'everyone') {
+                        timeout(time: 15, unit: 'MINUTES') {
+                            input(
+                                message: "⚠️ Enable '${params.FEATURE_FLAG_NAME}' for EVERYONE in ${NAMESPACE}?",
+                                ok: '✅ Enable for Everyone',
+                                submitter: 'admin,product-manager'
+                            )
+                        }
+                    }
+
+                    setFlag(params.FEATURE_FLAG_NAME, isEnable, group, percentage)
+
+                    echo "✅ Flag '${params.FEATURE_FLAG_NAME}' ${params.FLAG_ACTION}d for ${group}"
+
+                    // Verify flag state
+                    verifyFlag(params.FEATURE_FLAG_NAME)
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 4: GRADUAL ROLLOUT
+        // Tăng dần % users thấy feature: 5 → 20 → 50 → 100
+        // ======================================================
+        stage('Gradual Rollout') {
+            when { expression { params.ACTION == 'rollout' } }
+            steps {
+                script {
+                    def rolloutSteps = [5, 20, 50, 100]
+
+                    echo "📈 Starting gradual rollout of '${params.FEATURE_FLAG_NAME}'..."
+
+                    for (def pct in rolloutSteps) {
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                        echo "  Enabling for ${pct}% of users"
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+                        // Cập nhật flag percentage
+                        setFlag(params.FEATURE_FLAG_NAME, true, 'percentage', pct)
+
+                        // Monitor sau mỗi bước
+                        echo "📊 Monitoring for 30s at ${pct}%..."
+                        sleep(time: 30, unit: 'SECONDS')
+
+                        def metricsOk = checkFlagMetrics(params.FEATURE_FLAG_NAME, pct)
+                        if (!metricsOk) {
+                            echo "❌ Issues detected at ${pct}%! Disabling flag immediately..."
+                            setFlag(params.FEATURE_FLAG_NAME, false, 'everyone', 0)
+                            error("Rollout aborted at ${pct}% due to metrics issues")
+                        }
+
+                        echo "✅ ${pct}% rollout looks healthy"
+
+                        if (pct < 100) {
+                            timeout(time: 10, unit: 'MINUTES') {
+                                def nextPct = rolloutSteps[rolloutSteps.indexOf(pct) + 1]
+                                input(
+                                    message: "Metrics OK at ${pct}%. Proceed to ${nextPct}%?",
+                                    ok: "✅ Increase to ${nextPct}%"
+                                )
+                            }
+                        }
+                    }
+
+                    echo "🎉 Feature '${params.FEATURE_FLAG_NAME}' enabled for 100% of users!"
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 5: EMERGENCY ROLLBACK FLAG
+        // Tắt flag ngay lập tức — không cần deploy lại
+        // ======================================================
+        stage('Emergency Rollback Flag') {
+            when { expression { params.ACTION == 'rollback_flag' } }
+            steps {
+                script {
+                    echo "🚨 EMERGENCY: Disabling '${params.FEATURE_FLAG_NAME}' immediately!"
+
+                    // Tắt ngay — không cần approval
+                    setFlag(params.FEATURE_FLAG_NAME, false, 'everyone', 0)
+
+                    // Verify flag đã tắt
+                    verifyFlag(params.FEATURE_FLAG_NAME)
+
+                    echo """
+✅ Flag '${params.FEATURE_FLAG_NAME}' DISABLED in < 1 second
+   All users now see the old/stable version.
+   No deployment needed!
+"""
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo """
+╔════════════════════════════════════════╗
+║       Feature Toggle Summary           ║
+╠════════════════════════════════════════╣
+║  Flag      : ${params.FEATURE_FLAG_NAME}
+║  Action    : ${params.ACTION}
+║  Group     : ${params.TARGET_GROUP}
+║  Env       : ${params.DEPLOY_ENV}
+║  Status    : ${currentBuild.currentResult}
+╚════════════════════════════════════════╝
+"""
+            cleanWs()
+        }
+        success { echo '✅ Feature toggle operation completed!' }
+        failure  { echo '❌ Operation failed! Check flag state manually.' }
+    }
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+// Bật/tắt một feature flag qua API
+def setFlag(String flagName, boolean enabled, String group, int percentage) {
+    echo "  🎚  setFlag: ${flagName} → ${enabled ? 'ON' : 'OFF'} [${group}${percentage > 0 ? ' ' + percentage + '%' : ''}]"
+
+    // ---- LaunchDarkly ----
+    // sh """
+    //     curl -X PATCH https://app.launchdarkly.com/api/v2/flags/${env.NAMESPACE}/${flagName} \
+    //         -H "Authorization: ${env.FLAG_SERVICE_TOKEN}" \
+    //         -H "Content-Type: application/json" \
+    //         -d '[{"op":"replace","path":"/environments/${env.NAMESPACE}/on","value":${enabled}}]'
+    // """
+
+    // ---- Unleash ----
+    // sh """
+    //     curl -X POST ${env.FLAG_SERVICE_URL}/features/${flagName}/${enabled ? 'enable' : 'disable'} \
+    //         -H "Authorization: ${env.FLAG_SERVICE_TOKEN}" \
+    //         -H "Content-Type: application/json" \
+    //         -d '{"environment": "${env.NAMESPACE}"}'
+    // """
+
+    // ---- Custom flag service ----
+    // sh """
+    //     curl -X PUT ${env.FLAG_SERVICE_URL}/flags/${flagName} \
+    //         -H 'Content-Type: application/json' \
+    //         -d '{
+    //             "enabled": ${enabled},
+    //             "group": "${group}",
+    //             "percentage": ${percentage},
+    //             "environment": "${env.NAMESPACE}"
+    //         }'
+    // """
+
+    sh "echo 'FLAG ${flagName}: ${enabled ? 'ENABLED' : 'DISABLED'} for ${group}'"
+}
+
+// Kiểm tra trạng thái flag hiện tại
+def verifyFlag(String flagName) {
+    echo "  🔍 Verifying flag state: ${flagName}"
+
+    // def state = sh(
+    //     script: """
+    //         curl -s ${env.FLAG_SERVICE_URL}/flags/${flagName}?env=${env.NAMESPACE} \
+    //             -H "Authorization: ${env.FLAG_SERVICE_TOKEN}" | jq '.enabled'
+    //     """,
+    //     returnStdout: true
+    // ).trim()
+    // echo "  Current state: ${state}"
+
+    sh "echo 'Flag state verified'"
+}
+
+// Scan codebase để tìm tất cả feature flags được dùng
+def scanFeatureFlags() {
+    echo "  🔍 Scanning for feature flag usage in code..."
+
+    // sh """
+    //     echo '=== Feature Flags Found ==='
+    //     grep -rn 'featureFlag\\.isEnabled\|isFeatureEnabled\|getFlag' src/ || echo 'No flags found'
+    //     echo '=========================='
+    // """
+
+    sh "echo 'Feature flag scan complete'"
+}
+
+// Kiểm tra metrics sau khi bật flag
+def checkFlagMetrics(String flagName, int percentage) {
+    echo "  📊 Checking metrics for ${flagName} at ${percentage}%..."
+
+    // Thực tế: kiểm tra error rate, performance với users đang thấy feature mới
+    // def errorRate = sh(
+    //     script: """
+    //         curl -s "${env.METRICS_API}/query?query=rate(http_errors{feature='${flagName}'}[5m])" \
+    //             | jq '.data.result[0].value[1]'
+    //     """,
+    //     returnStdout: true
+    // ).trim().toFloat()
+
+    // Simulate: luôn OK
+    sh "echo 'Metrics OK for ${flagName} at ${percentage}%'"
+    return true
+}

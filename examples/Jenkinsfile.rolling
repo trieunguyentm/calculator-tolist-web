@@ -1,0 +1,344 @@
+// ============================================================
+// Jenkinsfile - Rolling Deployment Pattern
+//
+// Nguyên lý:
+//   - Update từng server/pod một trong cluster
+//   - Load balancer KHÔNG gửi traffic đến node đang được update
+//   - Sau khi health check pass → đưa node đó vào lại rotation
+//   - Không cần 2x infrastructure như Blue/Green
+// ============================================================
+
+pipeline {
+    agent any
+
+    options {
+        timeout(time: 45, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    parameters {
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['staging', 'production'],
+            description: 'Target environment'
+        )
+        string(
+            name: 'REPLICAS',
+            defaultValue: '4',
+            description: 'Tổng số replicas/instances trong cluster'
+        )
+        string(
+            name: 'MAX_UNAVAILABLE',
+            defaultValue: '1',
+            description: 'Số instances tối đa được phép down cùng lúc (1 = update từng cái)'
+        )
+        string(
+            name: 'MAX_SURGE',
+            defaultValue: '1',
+            description: 'Số instances tạm thêm trong quá trình update (0 = không tăng)'
+        )
+        booleanParam(
+            name: 'ROLLBACK',
+            defaultValue: false,
+            description: 'Rollback về revision trước?'
+        )
+    }
+
+    environment {
+        APP_NAME        = 'calculator-app'
+        DOCKER_REGISTRY = 'docker.io/yourusername'
+        IMAGE_TAG       = "${env.BUILD_NUMBER}"
+        NAMESPACE       = "${params.DEPLOY_ENV}"
+
+        // Health check settings
+        HEALTH_CHECK_PATH    = '/health'
+        HEALTH_CHECK_RETRIES = '5'
+        HEALTH_CHECK_DELAY   = '10'
+    }
+
+    stages {
+
+        // ======================================================
+        // STAGE 1: CHECKOUT & BUILD
+        // ======================================================
+        stage('Checkout') {
+            steps {
+                cleanWs()
+                checkout scm
+                echo "📥 Commit: ${sh(script:'git rev-parse --short HEAD', returnStdout:true).trim()}"
+            }
+        }
+
+        stage('Build & Test') {
+            agent {
+                docker { image 'node:18-alpine'; args '-u root'; reuseNode true }
+            }
+            steps {
+                sh 'npm ci'
+                sh 'npm test -- --watchAll=false'
+                sh 'npm run build'
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    env.NEW_IMAGE = "${DOCKER_REGISTRY}/${APP_NAME}:${IMAGE_TAG}"
+                    sh "docker build -t ${env.NEW_IMAGE} ."
+                    // sh "docker push ${env.NEW_IMAGE}"
+                    echo "🐳 Image: ${env.NEW_IMAGE}"
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 2: ROLLBACK — về revision trước nếu cần
+        // ======================================================
+        stage('Rollback') {
+            when { expression { params.ROLLBACK } }
+            steps {
+                script {
+                    echo '⏪ Rolling back to previous revision...'
+
+                    // ---- Kubernetes rollback ----
+                    // sh """
+                    //     kubectl rollout undo deployment/${APP_NAME} \
+                    //         --namespace=${NAMESPACE}
+                    //
+                    //     kubectl rollout status deployment/${APP_NAME} \
+                    //         --namespace=${NAMESPACE} \
+                    //         --timeout=5m
+                    //
+                    //     echo 'Rollback history:'
+                    //     kubectl rollout history deployment/${APP_NAME} \
+                    //         --namespace=${NAMESPACE}
+                    // """
+
+                    sh "echo 'Rolled back ${APP_NAME} to previous revision'"
+                    echo '✅ Rollback complete!'
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 3: PRE-DEPLOYMENT CHECKS
+        // Kiểm tra cluster health trước khi bắt đầu update
+        // ======================================================
+        stage('Pre-Deployment Checks') {
+            when { expression { !params.ROLLBACK } }
+            steps {
+                script {
+                    echo '🔍 Checking cluster state before rolling update...'
+
+                    // sh """
+                    //     # Kiểm tra tất cả pods đang chạy bình thường
+                    //     READY=\$(kubectl get deployment ${APP_NAME} -n ${NAMESPACE} \
+                    //         -o jsonpath='{.status.readyReplicas}')
+                    //     DESIRED=\$(kubectl get deployment ${APP_NAME} -n ${NAMESPACE} \
+                    //         -o jsonpath='{.spec.replicas}')
+                    //
+                    //     echo "Ready: \$READY / Desired: \$DESIRED"
+                    //
+                    //     if [ "\$READY" != "\$DESIRED" ]; then
+                    //         echo "⚠️ Not all replicas are ready. Aborting rolling update."
+                    //         exit 1
+                    //     fi
+                    // """
+
+                    def replicas = params.REPLICAS.toInteger()
+                    def maxUnavailable = params.MAX_UNAVAILABLE.toInteger()
+
+                    echo """
+Rolling Update Configuration:
+  Total replicas    : ${replicas}
+  Max unavailable   : ${maxUnavailable} (${(maxUnavailable * 100 / replicas).intValue()}% down at a time)
+  Max surge         : ${params.MAX_SURGE}
+  Min available     : ${replicas - maxUnavailable} instances always serving traffic
+"""
+                    echo '✅ Pre-deployment checks passed'
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 4: ROLLING UPDATE
+        // Update từng node một, load balancer tự động exclude node đang update
+        // ======================================================
+        stage('Rolling Update') {
+            when { expression { !params.ROLLBACK } }
+            steps {
+                script {
+                    echo '🔄 Starting rolling update...'
+
+                    // ============================================
+                    // Option A: Kubernetes (recommended)
+                    // Kubernetes tự xử lý rolling update
+                    // ============================================
+
+                    // sh """
+                    //     # Cấu hình rolling update strategy
+                    //     kubectl patch deployment ${APP_NAME} -n ${NAMESPACE} \
+                    //         --type=json \
+                    //         -p='[
+                    //             {"op":"replace","path":"/spec/strategy/type","value":"RollingUpdate"},
+                    //             {"op":"replace","path":"/spec/strategy/rollingUpdate/maxUnavailable","value":${params.MAX_UNAVAILABLE}},
+                    //             {"op":"replace","path":"/spec/strategy/rollingUpdate/maxSurge","value":${params.MAX_SURGE}}
+                    //         ]'
+                    //
+                    //     # Update image — triggers rolling update
+                    //     kubectl set image deployment/${APP_NAME} \
+                    //         ${APP_NAME}=${env.NEW_IMAGE} \
+                    //         --namespace=${NAMESPACE} \
+                    //         --record
+                    //
+                    //     echo 'Rolling update started. Watching progress...'
+                    //
+                    //     # Watch rollout status
+                    //     kubectl rollout status deployment/${APP_NAME} \
+                    //         --namespace=${NAMESPACE} \
+                    //         --timeout=10m
+                    // """
+
+                    // ============================================
+                    // Option B: Manual rolling update (bare metal / VMs)
+                    // Update từng server một theo thứ tự
+                    // ============================================
+                    def servers = ['server-1', 'server-2', 'server-3', 'server-4']
+                    def totalServers = servers.size()
+
+                    servers.eachWithIndex { server, index ->
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                        echo "  Updating ${server} (${index + 1}/${totalServers})"
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+                        // Bước 1: Xoá server khỏi load balancer
+                        echo "  [1/4] Draining ${server} from load balancer..."
+                        // sh "aws elbv2 deregister-targets --target-group-arn ${TG_ARN} --targets Id=${server}"
+                        sh "echo 'Drained ${server} — no longer receiving traffic'"
+                        sleep(time: 2, unit: 'SECONDS')
+
+                        // Bước 2: Deploy version mới lên server này
+                        echo "  [2/4] Deploying ${APP_NAME}:${IMAGE_TAG} to ${server}..."
+                        // sh """
+                        //     ssh deploy@${server} '
+                        //         docker pull ${env.NEW_IMAGE}
+                        //         docker stop ${APP_NAME} || true
+                        //         docker rm ${APP_NAME} || true
+                        //         docker run -d --name ${APP_NAME} -p 3000:3000 ${env.NEW_IMAGE}
+                        //     '
+                        // """
+                        sh "echo 'Deployed ${env.NEW_IMAGE} to ${server}'"
+                        sleep(time: 3, unit: 'SECONDS')
+
+                        // Bước 3: Health check server mới
+                        echo "  [3/4] Health checking ${server}..."
+                        def healthy = healthCheck(server)
+                        if (!healthy) {
+                            error("Health check failed for ${server}! Rolling back this node...")
+                        }
+                        echo "  ✅ ${server} is healthy"
+
+                        // Bước 4: Đưa server trở lại load balancer
+                        echo "  [4/4] Re-registering ${server} to load balancer..."
+                        // sh "aws elbv2 register-targets --target-group-arn ${TG_ARN} --targets Id=${server}"
+                        sh "echo '${server} re-registered — now receiving traffic'"
+
+                        def remaining = totalServers - index - 1
+                        if (remaining > 0) {
+                            echo "  ⏳ ${remaining} server(s) remaining..."
+                            sleep(time: 5, unit: 'SECONDS')
+                        }
+                    }
+
+                    echo '✅ All servers updated successfully!'
+                }
+            }
+        }
+
+        // ======================================================
+        // STAGE 5: POST-DEPLOYMENT VERIFICATION
+        // Xác nhận toàn bộ cluster đang chạy version mới
+        // ======================================================
+        stage('Post-Deployment Verification') {
+            when { expression { !params.ROLLBACK } }
+            steps {
+                script {
+                    echo '🔍 Verifying rolling update completion...'
+
+                    // sh """
+                    //     # Kiểm tra tất cả pods đang chạy image mới
+                    //     IMAGES=\$(kubectl get pods -n ${NAMESPACE} \
+                    //         -l app=${APP_NAME} \
+                    //         -o jsonpath='{.items[*].spec.containers[0].image}')
+                    //
+                    //     echo "Running images: \$IMAGES"
+                    //
+                    //     for IMAGE in \$IMAGES; do
+                    //         if [ "\$IMAGE" != "${env.NEW_IMAGE}" ]; then
+                    //             echo "Pod still running old image: \$IMAGE"
+                    //             exit 1
+                    //         fi
+                    //     done
+                    //
+                    //     echo 'All pods running new image: ${env.NEW_IMAGE}'
+                    //
+                    //     # Kiểm tra tổng thể deployment
+                    //     kubectl get deployment ${APP_NAME} -n ${NAMESPACE}
+                    //     kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME}
+                    // """
+
+                    sh "echo 'All instances running ${APP_NAME}:${IMAGE_TAG}'"
+                    echo '✅ Rolling update verified!'
+                    echo "   ${params.REPLICAS} replicas all running: ${env.NEW_IMAGE}"
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo """
+╔════════════════════════════════════╗
+║     Rolling Update Summary         ║
+╠════════════════════════════════════╣
+║  Build     : #${env.BUILD_NUMBER}
+║  Image     : ${APP_NAME}:${IMAGE_TAG}
+║  Replicas  : ${params.REPLICAS}
+║  Strategy  : maxUnavailable=${params.MAX_UNAVAILABLE}, maxSurge=${params.MAX_SURGE}
+║  Status    : ${currentBuild.currentResult}
+╚════════════════════════════════════╝
+"""
+            cleanWs()
+        }
+        success { echo '✅ Rolling update SUCCESSFUL!' }
+        failure {
+            echo '❌ Rolling update FAILED!'
+            echo '   Run with ROLLBACK=true to undo.'
+        }
+    }
+}
+
+// ============================================================
+// Helper: Health check một server
+// ============================================================
+def healthCheck(String server) {
+    def retries = env.HEALTH_CHECK_RETRIES.toInteger()
+    for (int i = 1; i <= retries; i++) {
+        echo "   Health check attempt ${i}/${retries}..."
+
+        // def status = sh(
+        //     script: "curl -s -o /dev/null -w '%{http_code}' http://${server}:3000${env.HEALTH_CHECK_PATH}",
+        //     returnStdout: true
+        // ).trim()
+
+        def status = '200'  // Simulate
+        if (status == '200') {
+            return true
+        }
+        echo "   Attempt ${i} failed (status: ${status})"
+        sleep(time: env.HEALTH_CHECK_DELAY.toInteger(), unit: 'SECONDS')
+    }
+    return false
+}
